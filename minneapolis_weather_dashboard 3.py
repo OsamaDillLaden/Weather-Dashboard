@@ -1,4 +1,4 @@
-# minneapolis_weather_dashboard 3.py
+# minneapolis_weather_dashboard.py
 # -------------------------------------------------
 # Minneapolis Weather Market Dashboard
 # Sources: NWS, AccuWeather, OpenWeatherMap, WeatherAPI, Apple Weather, Google Weather
