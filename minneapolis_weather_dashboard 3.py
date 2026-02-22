@@ -18,6 +18,28 @@ import requests
 from bs4 import BeautifulSoup
 import sqlite3
 import os
+import base64
+
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.backends import default_backend
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
+# -----------------------
+# AUTO TICKER GENERATOR
+# -----------------------
+def get_kalshi_ticker_for_today():
+    """Auto-generates the Kalshi Minneapolis high temp ticker for today.
+    Format: kxhightmin-YYmmmDD  e.g. kxhightmin-26feb22"""
+    today = date.today()
+    return f"kxhightmin-{today.strftime('%y%b%d').lower()}"
+
+def get_kalshi_ticker_for_date(target_date):
+    """Generate ticker for any date — useful for browsing past/future markets."""
+    return f"kxhightmin-{target_date.strftime('%y%b%d').lower()}"
 
 # -----------------------
 # PAGE CONFIG
@@ -253,10 +275,17 @@ with st.sidebar:
     st.markdown("## ⚙️ Configuration")
     st.markdown("---")
     st.markdown("### 🔑 API Keys")
-    accu_key   = st.text_input("AccuWeather Key",    value="", type="password", placeholder="Enter key...")
-    owm_key    = st.text_input("OpenWeatherMap Key", value="", type="password", placeholder="Enter key...")
-    wapi_key   = st.text_input("WeatherAPI.com Key", value="", type="password", placeholder="Enter key...")
-    kalshi_key = st.text_input("Kalshi API Key",     value="", type="password", placeholder="Enter key...")
+    accu_key        = st.text_input("AccuWeather Key",       value="", type="password", placeholder="Enter key...")
+    owm_key         = st.text_input("OpenWeatherMap Key",    value="", type="password", placeholder="Enter key...")
+    wapi_key        = st.text_input("WeatherAPI.com Key",    value="", type="password", placeholder="Enter key...")
+
+    st.markdown("---")
+    st.markdown("### 🔵 Kalshi Authentication")
+    kalshi_key_id   = st.text_input("Kalshi Key ID (UUID)",  value="", placeholder="e.g. a952bcbe-ec3b-...")
+    kalshi_pem_path = st.text_input("Private Key File Path", value="", placeholder="/Users/you/.kalshi/private_key.pem")
+
+    if not CRYPTO_AVAILABLE:
+        st.warning("⚠️ Install cryptography: `pip install cryptography`")
 
     st.markdown("---")
     st.markdown("### 📊 Market Settings")
@@ -265,7 +294,19 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 🎯 Kalshi Market")
-    kalshi_ticker = st.text_input("Kalshi Ticker", value="HIGHTEMP-23FEB-T30")
+    auto_ticker    = get_kalshi_ticker_for_today()
+    use_auto       = st.checkbox("Auto-ticker (today's market)", value=True)
+    if use_auto:
+        kalshi_ticker = auto_ticker
+        st.success(f"✅ Today's ticker: `{kalshi_ticker}`")
+    else:
+        kalshi_ticker = st.text_input("Manual Ticker Override", value=auto_ticker)
+
+    # Show next 3 days for reference
+    st.caption("Upcoming tickers:")
+    for i in range(1, 4):
+        future = date.today() + timedelta(days=i)
+        st.caption(f"  +{i}d: `{get_kalshi_ticker_for_date(future)}`")
 
     st.markdown("---")
     st.markdown("### 🧠 Weight Window")
@@ -411,16 +452,52 @@ def fetch_polymarket_odds():
     except:
         return 0.42, "Polymarket (simulated)", "N/A", False
 
+def _sign_kalshi_request(private_key_pem: str, timestamp_ms: str, method: str, path: str) -> str:
+    """Sign a Kalshi API request with RSA private key (PSS SHA-256)."""
+    private_key = serialization.load_pem_private_key(
+        private_key_pem.encode(), password=None, backend=default_backend()
+    )
+    msg = (timestamp_ms + method.upper() + path).encode("utf-8")
+    signature = private_key.sign(
+        msg,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+        hashes.SHA256()
+    )
+    return base64.b64encode(signature).decode("utf-8")
+
 @st.cache_data(ttl=120)
-def fetch_kalshi_odds(api_key, ticker):
+def fetch_kalshi_odds(key_id: str, pem_path: str, ticker: str):
+    """Fetch Kalshi market odds using RSA key-pair authentication."""
     try:
-        if not api_key: raise ValueError()
-        headers = {"Authorization": f"Token {api_key}", "Content-Type": "application/json"}
-        r = requests.get(f"https://trading-api.kalshi.com/trade-api/v2/markets/{ticker}", headers=headers, timeout=10)
+        if not key_id or not pem_path:
+            raise ValueError("Missing Kalshi credentials")
+        if not CRYPTO_AVAILABLE:
+            raise ImportError("cryptography package not installed")
+
+        # Load private key from local file
+        with open(os.path.expanduser(pem_path), "r") as f:
+            private_key_pem = f.read()
+
+        timestamp_ms = str(int(datetime.now().timestamp() * 1000))
+        path         = f"/trade-api/v2/markets/{ticker}"
+        signature    = _sign_kalshi_request(private_key_pem, timestamp_ms, "GET", path)
+
+        headers = {
+            "KALSHI-ACCESS-KEY":       key_id,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+            "Content-Type":            "application/json",
+        }
+        r = requests.get(f"https://trading-api.kalshi.com{path}", headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json()["market"]
-        return data.get("yes_ask", data.get("last_price", 45))/100.0, data.get("title", ticker), data.get("volume","N/A"), True
-    except:
+        price = data.get("yes_ask", data.get("last_price", 45))
+        return float(price) / 100.0, data.get("title", ticker), data.get("volume", "N/A"), True
+
+    except FileNotFoundError:
+        st.sidebar.warning(f"⚠️ Kalshi key file not found: {pem_path}")
+        return 0.44, f"Kalshi: {ticker} (key file missing)", "N/A", False
+    except Exception:
         return 0.44, f"Kalshi: {ticker} (simulated)", "N/A", False
 
 # ==============================================================
@@ -435,7 +512,7 @@ with st.spinner("Fetching live data from all sources..."):
     goog_fc,  goog_live  = fetch_google_weather()
     actuals,  act_live   = fetch_nws_actuals()
     poly_prob, poly_title, poly_vol, poly_live = fetch_polymarket_odds()
-    kals_prob, kals_title, kals_vol, kals_live = fetch_kalshi_odds(kalshi_key, kalshi_ticker)
+    kals_prob, kals_title, kals_vol, kals_live = fetch_kalshi_odds(kalshi_key_id, kalshi_pem_path, kalshi_ticker)
 
 market_avg_prob = (poly_prob + kals_prob) / 2
 
@@ -861,7 +938,8 @@ st.markdown(f"""
     🧠 <strong style="color:#8ab4f8;">{days_footer} days</strong> of persistent history &nbsp;·&nbsp;
     Weights: {weight_label} RMSE &nbsp;·&nbsp;
     NWS & Polymarket: free &nbsp;·&nbsp; AccuWeather, OWM, WeatherAPI, Kalshi: require keys &nbsp;·&nbsp;
-    Apple via wttr.in · Google scraped &nbsp;·&nbsp;
+    Kalshi ticker: <strong style="color:#8ab4f8;">{kalshi_ticker}</strong> (auto) &nbsp;·&nbsp;
     Auto-refresh: 2 min &nbsp;·&nbsp; {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 </div>
 """, unsafe_allow_html=True)
+
