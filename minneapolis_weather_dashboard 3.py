@@ -488,7 +488,7 @@ def fetch_kalshi_odds(key_id: str, pem_path: str, ticker: str):
             "KALSHI-ACCESS-SIGNATURE": signature,
             "Content-Type":            "application/json",
         }
-        r = requests.get(f"https://trading-api.kalshi.com{path}", headers=headers, timeout=10)
+        r = requests.get(f"https://api.elections.kalshi.com{path}", headers=headers, timeout=10)
         r.raise_for_status()
         data = r.json()["market"]
         price = data.get("yes_ask", data.get("last_price", 45))
@@ -942,4 +942,3 @@ st.markdown(f"""
     Auto-refresh: 2 min &nbsp;·&nbsp; {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 </div>
 """, unsafe_allow_html=True)
-
